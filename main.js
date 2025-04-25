@@ -14,37 +14,81 @@ try {
     console.error('Failed to initialize Oracle Thin Mode:', err);
 }
 
-// Função para executar queries
-async function executeOracleQuery(user, password, connectString, query) {
+// Função para substituir binds no SQL (apenas para log)
+function substituteBinds(sql, bindParams) {
+    let debugSql = sql;
+    for (const [key, value] of Object.entries(bindParams)) {
+        const escapedValue = typeof value === 'string' ? `'${value.replace(/'/g, "''")}'` : value;
+        debugSql = debugSql.replace(new RegExp(`:${key}\\b`, 'g'), escapedValue);
+    }
+    return debugSql;
+}
+
+// Função para executar queries genéricas
+async function executeOracleOperation(user, password, connectString, sql, paramsJson) {
     const config = { user, password, connectString };
     let connection;
 
     try {
-        connection = await oracledb.getConnection(config);
-        const result = await connection.execute(query, [], {
+
+        // Parse seguro dos parâmetros
+        const params = paramsJson ? JSON.parse(paramsJson) : {};
+
+        // Configuração de execução
+        const options = {
             outFormat: oracledb.OUT_FORMAT_OBJECT,
-            fetchInfo: {
-                "RAW_COLUMN": { type: oracledb.BUFFER }, // Força como Buffer
-                "BLOB_COLUMN": { type: oracledb.STRING } // Converte para string
-            }
-        });
+            autoCommit: true
+        };
 
-        // Processa as colunas RAW
-        const processedRows = result.rows.map(row => {
-            const processedRow = {};
-            for (const [key, value] of Object.entries(row)) {
-                if (value instanceof Buffer) {
-                    // Converte RAW para hexadecimal
-                    processedRow[key] = value.toString('hex').toUpperCase();
-                } else {
-                    processedRow[key] = value;
-                }
-            }
-            return processedRow;
-        });
-        return processedRows;
+        connection = await oracledb.getConnection(config);
 
+        // Identifica o tipo de operação
+        const operationType = sql.trim().split(/\s+/)[0].toUpperCase();
+
+        // Executa a operação
+        const result = await connection.execute(sql, params, options);
+
+        // Formata a resposta conforme o tipo de operação
+        switch (operationType) {
+            case 'SELECT':
+                // Processa colunas RAW/BLOB para SELECT
+                const processedRows = result.rows.map(row => {
+                    const processedRow = {};
+                    for (const [key, value] of Object.entries(row)) {
+                        processedRow[key] = (value instanceof Buffer)
+                            ? value.toString('hex').toUpperCase()
+                            : value;
+                    }
+                    return processedRow;
+                });
+                return {
+                    operation: 'SELECT',
+                    rows: processedRows,
+                    rowCount: result.rows.length
+                };
+
+            case 'INSERT':
+            case 'UPDATE':
+            case 'DELETE':
+                return {
+                    operation: operationType,
+                    rowCount: result.rowsAffected,
+                    message: `${result.rowsAffected} linha(s) afetada(s)`
+                };
+
+            default:
+                return {
+                    operation: operationType,
+                    message: 'Operação executada com sucesso'
+                };
+        }
+
+    } catch (err) {
+        // Adiciona o SQL com binds substituídos ao erro
+        err.debugSql = substituteBinds(sql, bindParams);
+        throw err;
     } finally {
+        // Fechamento seguro da conexão
         if (connection) {
             try {
                 await connection.close();
@@ -58,37 +102,44 @@ async function executeOracleQuery(user, password, connectString, query) {
 // Endpoint POST para executar queries
 app.post('/query', async (req, res) => {
     try {
-        const { user, password, connectString, query } = req.body;
+        const { user, password, connectString, sql, params } = req.body;
 
-        if (!user || !password || !connectString || !query) {
+        if (!user || !password || !connectString || !sql) {
             return res.status(400).json({
-                error: 'Parâmetros obrigatórios faltando: user, password, connectString, query'
+                error: 'Parâmetros obrigatórios faltando: user, password, connectString, sql'
             });
         }
 
-        const result = await executeOracleQuery(user, password, connectString, query);
+        const result = await executeOracleOperation(user, password, connectString, sql, params);
         res.json({ success: true, data: result });
 
     } catch (err) {
         res.status(500).json({
             success: false,
-            query: req.body.query,
+            debugSql: err.debugSql,
+            originalSql: req.body.sql,
+            bindParams: req.body.params,
             error: err.message,
             details: err.stack
         });
     }
 });
 
-// Endpoint GET simples para teste
+// Endpoint GET para verificação
 app.get('/status', (req, res) => {
     res.json({
         status: 'online',
         service: 'Oracle Query Endpoint',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        features: ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'CALL']
     });
 });
 
-// Inicia o servidor quando o plugin é carregado
+app.post('/echo', (req,res) => {
+    res.json(req.body)
+})
+
+// Inicia o servidor
 let server;
 try {
     server = app.listen(PORT, () => {
@@ -99,12 +150,12 @@ try {
     console.error('Erro ao iniciar servidor:', err);
 }
 
-// Mantém a funcionalidade original do plugin
+// Mantém a funcionalidade original do plugin  com suporte a operações
 module.exports.templateTags = [
     {
-        name: 'oracle_query',
-        displayName: 'Oracle Query',
-        description: 'Executa uma consulta SELECT no Oracle e retorna JSON',
+        name: 'oracle_operation',
+        displayName: 'Oracle Operation',
+        description: 'Executa operações SQL no Oracle (SELECT, INSERT, UPDATE, DELETE)',
         args: [
             {
                 displayName: 'User',
@@ -122,13 +173,21 @@ module.exports.templateTags = [
                 placeholder: 'host:port/service_name'
             },
             {
-                displayName: 'Query',
+                displayName: 'SQL',
                 type: 'string',
-                placeholder: 'SELECT * FROM tabela'
+                placeholder: 'SELECT * FROM tabela WHERE id = :id'
+            }
+            ,
+            {
+                displayName: 'Params (JSON)',
+                type: 'string',
+                placeholder: '{"id": 1}',
+                optional: true
             }
         ],
-        async run(context, user, password, connectString, query) {
-            const rows = await executeOracleQuery(user, password, connectString, query);
+        async run(context, user, password, connectString, sql, paramsJson = '{}') {
+            const params = JSON.parse(paramsJson);
+            const rows = await executeOracleOperation(user, password, connectString, sql, params);
             return JSON.stringify(rows, null, 2);
         }
     }
